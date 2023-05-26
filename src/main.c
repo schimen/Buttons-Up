@@ -14,13 +14,20 @@
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/uuid.h>
 
-#define SW0_NODE DT_ALIAS(sw0)
-#define VOLUME_UP_KEY 0x80       // For iPhone and Android cameras
-#define KEYBOARD_RETURN_KEY 0x58 // For some other android cameras
+#include <zephyr/pm/pm.h>
+#include <zephyr/pm/device.h>
+#include <hal/nrf_gpio.h>
+
+#include "hids_button.h"
+
+#define BUTTON_TIMEOUT 2000
 
 LOG_MODULE_REGISTER(buttons_up);
 
-static const struct bt_data ad[] = {
+const struct gpio_dt_spec sw0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+
+const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_HIDS_VAL),
                   BT_UUID_16_ENCODE(BT_UUID_BAS_VAL)),
@@ -65,105 +72,6 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .security_changed = security_changed,
 };
 
-struct hids_info {
-  uint16_t version; // Version number of USB HID specification
-  uint16_t code;    // Country HID Device hardware is localized for
-  uint8_t flags;
-} __packed;
-
-struct hids_report {
-  uint8_t id;   // Report ID
-  uint8_t type; // Report Type
-} __packed;
-
-static struct hids_info info = {
-    .version = 0x0111,
-    .code = 0x0002,
-    .flags = BIT(1), // Normally Connectable
-};
-
-static struct hids_report input = {
-    .id = 0x01,
-    .type = 0x01, // Input
-};
-
-static uint8_t report_map[] = {
-    0x05, 0x01, // Usage Page (Generic Desktop)
-    0x09, 0x06, // Usage (Keyboard)
-    0xA1, 0x01, // Collection (Application)
-    // Modifier byte
-    0x05, 0x07, //   Usage Page (Key Codes)
-    0x19, 0xE0, //   Usage Minimum (Keyboard Left Control)
-    0x29, 0xE7, //   Usage Maximum (Keyboard Right GUI)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x25, 0x01, //   Logical Maximum (1)
-    0x75, 0x01, //   Report Size (1)
-    0x95, 0x08, //   Report Count (8)
-    0x81, 0x02, //   Input (Data, Variable, Absolute)
-    // Reserved byte
-    0x95, 0x01, //   Report Count (1)
-    0x75, 0x08, //   Report Size (8)
-    0x81, 0x01, //   Input (Constant)
-    // Key array (2 bytes)
-    0x95, 0x02, //   Report Count (2)
-    0x75, 0x08, //   Report Size (8)
-    0x15, 0x00, //   Logical Minimum (No event indicated)
-    0x25, 0x81, //   Logical Maximum (Keyboard Volume Down)
-    0x05, 0x07, //   Usage Page (Key Codes)
-    0x19, 0x00, //   Usage Minimum (No event indicated)
-    0x29, 0x81, //   Usage Maximum (Keyboard Volume Down)
-    0x81, 0x00, //   Input (Data, Array)
-    0xC0,       // End collection
-};
-
-uint8_t notify_enabled = 0;
-
-static ssize_t read_info(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-                         void *buf, uint16_t len, uint16_t offset) {
-  return bt_gatt_attr_read(conn, attr, buf, len, offset, attr->user_data,
-                           sizeof(struct hids_info));
-}
-
-static ssize_t read_report_map(struct bt_conn *conn,
-                               const struct bt_gatt_attr *attr, void *buf,
-                               uint16_t len, uint16_t offset) {
-  return bt_gatt_attr_read(conn, attr, buf, len, offset, report_map,
-                           sizeof(report_map));
-}
-
-static ssize_t read_report(struct bt_conn *conn,
-                           const struct bt_gatt_attr *attr, void *buf,
-                           uint16_t len, uint16_t offset) {
-  return bt_gatt_attr_read(conn, attr, buf, len, offset, attr->user_data,
-                           sizeof(struct hids_report));
-}
-
-static void input_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value) {
-  notify_enabled = (value == BT_GATT_CCC_NOTIFY) ? 1 : 0;
-}
-
-static ssize_t read_input_report(struct bt_conn *conn,
-                                 const struct bt_gatt_attr *attr, void *buf,
-                                 uint16_t len, uint16_t offset) {
-  return bt_gatt_attr_read(conn, attr, buf, len, offset, NULL, 0);
-}
-
-// Define HID service
-BT_GATT_SERVICE_DEFINE(
-    button_service, BT_GATT_PRIMARY_SERVICE(BT_UUID_HIDS),
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_INFO, BT_GATT_CHRC_READ,
-                           BT_GATT_PERM_READ, read_info, NULL, &info),
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT_MAP, BT_GATT_CHRC_READ,
-                           BT_GATT_PERM_READ, read_report_map, NULL, NULL),
-    BT_GATT_CHARACTERISTIC(BT_UUID_HIDS_REPORT,
-                           BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
-                           BT_GATT_PERM_READ_ENCRYPT, read_input_report, NULL,
-                           NULL),
-    BT_GATT_CCC(input_ccc_changed,
-                BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT),
-    BT_GATT_DESCRIPTOR(BT_UUID_HIDS_REPORT_REF, BT_GATT_PERM_READ, read_report,
-                       NULL, &input));
-
 static void bt_ready(int err) {
   if (err) {
     LOG_ERR("Bluetooth init failed (err %d)", err);
@@ -176,21 +84,61 @@ static void bt_ready(int err) {
   }
 }
 
-void button_loop() {
-  const struct gpio_dt_spec sw0 = GPIO_DT_SPEC_GET(SW0_NODE, gpios);
-  gpio_pin_configure_dt(&sw0, GPIO_INPUT);
+void turn_system_off() {
+  // Blink led
+  gpio_pin_set_dt(&led0, 1);
+  for (int i = 0; i < 5; i++) {
+    k_msleep(100);
+    gpio_pin_toggle_dt(&led0);
+  }
+  // Configure to generate PORT event (wakeup) on button press
+	nrf_gpio_cfg_input(NRF_DT_GPIOS_TO_PSEL(DT_ALIAS(sw0), gpios),
+			   NRF_GPIO_PIN_PULLUP);
+	nrf_gpio_cfg_sense_set(NRF_DT_GPIOS_TO_PSEL(DT_ALIAS(sw0), gpios),
+			       NRF_GPIO_PIN_SENSE_LOW);
+  // Turn off
+  pm_state_force(0u, &(struct pm_state_info){PM_STATE_SOFT_OFF, 0, 0});
+  k_msleep(1000); // 1 Second delay for turning off
+}
 
+void button_loop() {
+  int64_t uptime = k_uptime_get();
   for (;;) {
-    if (notify_enabled == 1) {
-      uint8_t report[] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (notify_enabled()) {
       if (gpio_pin_get_dt(&sw0)) {
-        report[2] = VOLUME_UP_KEY;
-        report[3] = KEYBOARD_RETURN_KEY;
+        gpio_pin_set_dt(&led0, 1);
+        if (k_uptime_get() - uptime > BUTTON_TIMEOUT) {
+          break;
+        }
+        notify_volume_down(NULL);
       }
-      bt_gatt_notify(NULL, &button_service.attrs[5], report, sizeof(report));
+      else {
+        uptime = k_uptime_get();
+        notify_no_key(NULL);
+      }
     }
     k_msleep(100);
+    gpio_pin_set_dt(&led0, 0);
   }
+  turn_system_off();
+}
+
+int gpio_init() {
+  int err;
+  err = gpio_pin_configure_dt(&sw0, GPIO_INPUT);
+  if (err) {
+    LOG_ERR("Error %d: failed to configure %s pin %d", err, sw0.port->name, sw0.pin);
+    return err;
+  }
+  // Init led0
+  err = gpio_pin_configure_dt(&led0, GPIO_OUTPUT_INACTIVE);
+  if (err) {
+    LOG_ERR(
+      "Error %d: failed to configure %s pin %d",
+      err, led0.port->name, led0.pin
+    );
+  }
+  return err;
 }
 
 void main(void) {
@@ -199,5 +147,6 @@ void main(void) {
     LOG_ERR("Bluetooth init failed (err %d)\n", err);
     return;
   }
+  gpio_init();
   button_loop();
 }
